@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-12
+
+Documentation and SEO pass. No code changes.
+
+### Changed
+
+- README header standardized: Rust logo image, MSRV badge between CI and docs.rs (was at the end of the badge list, lowercase label), copyright block at bottom.
+- Subtitle now reads `DEPENDENCY AUDIT & LICENSE POLICY FOR RUST` (was `SECURITY AUDITING FOR RUST`). More specific; surfaces the license-policy half of the crate's value.
+- Tagline rewritten to lead with the underlying tools (`cargo-audit` + `cargo-deny`) and the outcomes (CVEs, license policy, banned crates).
+- `## The dev-* suite` retitled to `The dev-* collection` and expanded with the full 14-crate map.
+- `Cargo.toml` description rewritten: leads with the wrapped tools and the actual policy surface.
+- `Cargo.toml` keywords retuned: dropped `verification` and `ai-tools`, added `license` and `rustsec` for crates.io search.
+
+### Added
+
+- "Part of the `dev-*` verification collection" block on the README, under the intro, linking the umbrella `dev-tools` crate.
+
+[0.9.1]: https://github.com/jamesgober/dev-security/releases/tag/v0.9.1
+
 ## [0.9.0] - 2026-05-12
 
 Foundation release. Replaces the `0.1.0` name-claim with full
