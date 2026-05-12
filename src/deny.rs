@@ -90,7 +90,6 @@ struct DenyGraph {
 
 pub(crate) fn parse(ndjson: &str) -> Result<Vec<Finding>, AuditError> {
     let mut findings = Vec::new();
-    let mut counter: usize = 0;
     for (line_num, raw) in ndjson.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() {
@@ -105,30 +104,33 @@ pub(crate) fn parse(ndjson: &str) -> Result<Vec<Finding>, AuditError> {
         if record.kind != "diagnostic" {
             continue;
         }
-        let severity = severity_from_label(&record.fields.severity);
-        let Some(severity) = severity else { continue };
+        let Some(severity) = severity_from_label(&record.fields.severity) else {
+            continue;
+        };
 
         // Prefer the diagnostic's code (e.g. "license-not-allowed") as
         // the stable identifier; fall back to a synthetic line-number id.
-        counter += 1;
         let id = record
             .fields
             .code
             .clone()
             .unwrap_or_else(|| format!("DENY-{:04}", line_num + 1));
 
+        // Empty `graphs` is legitimate (e.g. a workspace-level policy
+        // violation); represent it explicitly rather than emitting an
+        // invalid empty-string crate name.
         let (affected_crate, affected_version) = record
             .fields
             .graphs
             .first()
-            .map(|g| (g.name.clone(), non_empty(&g.version)))
-            .unwrap_or_else(|| (String::new(), None));
+            .map(|g| (non_empty_string(&g.name), non_empty(&g.version)))
+            .unwrap_or((None, None));
 
         findings.push(Finding {
             id,
             title: short_title(&record.fields.message),
             severity,
-            affected_crate,
+            affected_crate: affected_crate.unwrap_or_else(|| "<workspace>".to_string()),
             affected_version,
             url: None,
             description: if record.fields.message.is_empty() {
@@ -139,8 +141,6 @@ pub(crate) fn parse(ndjson: &str) -> Result<Vec<Finding>, AuditError> {
             source: FindingSource::Deny,
         });
     }
-    // counter is just a sanity guard for future debugging.
-    let _ = counter;
     Ok(findings)
 }
 
@@ -160,7 +160,13 @@ fn short_title(msg: &str) -> String {
     } else if first_line.len() <= 120 {
         first_line.to_string()
     } else {
-        let mut s = first_line[..117].to_string();
+        // Find the largest char-boundary index <= 117 so the slice
+        // never falls inside a multi-byte UTF-8 codepoint.
+        let mut end = 117;
+        while end > 0 && !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut s = first_line[..end].to_string();
         s.push_str("...");
         s
     }
@@ -172,6 +178,10 @@ fn non_empty(s: &str) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+fn non_empty_string(s: &str) -> Option<String> {
+    non_empty(s)
 }
 
 #[cfg(test)]
@@ -252,5 +262,27 @@ not-json
         let t = short_title(&msg);
         assert!(t.ends_with("..."));
         assert_eq!(t.len(), 120);
+    }
+
+    #[test]
+    fn short_title_handles_multibyte_at_truncation_boundary() {
+        // Pad the first 110 bytes with ASCII so the 117-byte truncation
+        // index lands inside the multi-byte "é" (which is 2 bytes in UTF-8).
+        // Naive `&s[..117]` would panic here.
+        let mut msg = "x".repeat(110);
+        msg.push_str("éééééééééééééééé"); // each 'é' is 2 bytes
+        let t = short_title(&msg);
+        assert!(t.ends_with("..."));
+        // Output must be valid UTF-8 (no panic) and stay under the cap.
+        assert!(t.len() <= 120);
+    }
+
+    #[test]
+    fn empty_graphs_become_workspace_sentinel() {
+        let ndjson = r#"{"type":"diagnostic","fields":{"severity":"error","code":"W001","message":"workspace policy violation"}}"#;
+        let findings = parse(ndjson).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].affected_crate, "<workspace>");
+        assert!(findings[0].affected_version.is_none());
     }
 }
