@@ -1,6 +1,6 @@
 [package]
 name = "dev-security"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 rust-version = "1.85"
 readme = "README.md"
@@ -10,14 +10,14 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Security auditing for Rust. Wraps cargo-audit and cargo-deny. Vulnerability scanning, license compliance, banned-crate policies. Part of the dev-* verification suite."
+description = "Dependency audit and license policy for Rust. Wraps cargo-audit + cargo-deny: known-CVE scanning, license enforcement, banned-crate policies. Part of the dev-* verification collection."
 
 keywords = [
     "security",
     "audit",
     "cve",
-    "verification",
-    "ai-tools"
+    "license",
+    "rustsec"
 ]
 
 categories = [
