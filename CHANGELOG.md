@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-12
+
+Bug-fix release surfaced by the post-polish audit pass.
+
+### Fixed
+
+- `deny::short_title()` no longer panics when the first 117 bytes of a `cargo-deny` diagnostic message end inside a multi-byte UTF-8 codepoint. The naive `&first_line[..117]` slice has been replaced with a char-boundary walkback. A regression test pins the behavior using a string with `é` (2-byte) characters straddling the truncation index.
+- `deny::parse()` no longer emits findings with `affected_crate: ""` when a diagnostic record has no `graphs` entries (workspace-level policy violations). Empty names now become the explicit `<workspace>` sentinel so consumers can detect the case rather than silently swallowing an empty string.
+- Dead `counter` variable removed from `deny::parse()` — it had no effect, masked the real iteration flow, and was flagged by the audit as suspicious.
+
+### Internal
+
+- Two new tests: `short_title_handles_multibyte_at_truncation_boundary` (UTF-8 regression) and `empty_graphs_become_workspace_sentinel` (sentinel behavior).
+
+[0.9.2]: https://github.com/jamesgober/dev-security/releases/tag/v0.9.2
+
 ## [0.9.1] - 2026-05-12
 
 Documentation and SEO pass. No code changes.
