@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-05-18
+
+MSRV rollback to Rust 1.75. Backed off from 1.85 after `dev-fixtures`
+swapped `tempfile` → `mod-tempdir` 1.0 in its own 0.9.5 release,
+eliminating the `getrandom 0.4.2 → edition2024` chain that was the
+sole reason the dev-* collection sat at 1.85. No code changes here;
+this crate's own runtime dependencies have always been
+1.75-compatible.
+
+### Changed
+
+- `rust-version` lowered from `1.85` to `1.75` in `Cargo.toml`.
+- MSRV badge in README updated from `1.85+` to `1.75+`.
+
+### Notes
+
+- No code change. No API change. No new dependencies.
+- Library, examples, and tests all build clean on Rust 1.75 (verified).
+
+[0.9.3]: https://github.com/jamesgober/dev-security/releases/tag/v0.9.3
+
 ## [0.9.2] - 2026-05-12
 
 Bug-fix release surfaced by the post-polish audit pass.
