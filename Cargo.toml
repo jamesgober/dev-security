@@ -39,9 +39,6 @@ dev-report = { version = "0.9", path = "../dev-report" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-[dev-dependencies]
-tempfile = "3"
-
 [features]
 default = []
 

@@ -7,24 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.3] - 2026-05-18
+## [0.9.3] - 2026-10-09
 
-MSRV rollback to Rust 1.75. Backed off from 1.85 after `dev-fixtures`
-swapped `tempfile` → `mod-tempdir` 1.0 in its own 0.9.5 release,
-eliminating the `getrandom 0.4.2 → edition2024` chain that was the
-sole reason the dev-* collection sat at 1.85. No code changes here;
-this crate's own runtime dependencies have always been
-1.75-compatible.
+cargo-deny results are read at all, cargo-audit severities come from
+CVSS, plus the MSRV rollback to Rust 1.75. The rollback follows
+`dev-fixtures` 0.9.5 swapping `tempfile` for `mod-tempdir` 1.0, which
+removed the `getrandom 0.4.2 -> edition2024` chain that held the dev-*
+collection at 1.85.
+
+### Added
+
+- RUSTSEC advisories without their own URL link to their rustsec.org
+  page.
+- `VERSION` constant with the crate version as compiled, so tools that
+  bundle this crate can report what is actually linked.
+
+### Fixed
+
+- **cargo-deny findings were never read.** cargo-deny writes its JSON
+  lines to stderr and only stdout was read, so any run with a violation
+  became `SubprocessFailed` holding raw JSON, and a run with only
+  warnings reported nothing. Both streams are read now.
+- `deny_config()` passed `--config` before `check`, where `cargo deny`
+  rejects it, so a custom deny.toml always failed.
+- Every cargo-deny finding named `<workspace>` as the crate. The crate
+  is now read from `graphs[].Krate` (the flat shape is still accepted).
+- cargo-deny advisory findings used the diagnostic code
+  (`vulnerability`, `unmaintained`) as their id instead of the RUSTSEC
+  id, so the allow-list could not match them and they never merged with
+  the cargo-audit copy. They now use the advisory id and URL.
+- A `cargo deny` run that failed before finishing (bad deny.toml, no
+  Cargo.toml, advisory database fetch failure) could come back as a
+  clean result. A non-zero exit without a summary record is now
+  `SubprocessFailed` with the error lines.
+- **Every cargo-audit vulnerability was `Warning`.** cargo-audit has no
+  severity field, only a CVSS vector. The CVSS 3.0 / 3.1 / 4.0 base
+  score is now computed from the vector (standard library only; it
+  matches the RustSec `cvss` crate on every vector in the advisory
+  database) and mapped critical / high / medium / low to Critical /
+  Error / Warning / Info.
+- Yanked-crate warnings (`"advisory": null`) failed to decode and took
+  the rest of their warning list with them. Entries are decoded one at
+  a time, and yanked crates are reported with id `yanked`.
+- The parse-error preview sliced at byte 200 and could panic inside a
+  multi-byte character.
 
 ### Changed
 
-- `rust-version` lowered from `1.85` to `1.75` in `Cargo.toml`.
-- MSRV badge in README updated from `1.85+` to `1.75+`.
+- Findings are de-duplicated by `(id, crate, version)` and keep the most
+  severe copy. The key had no version and the first copy won, so a
+  second vulnerable version of the same crate was dropped.
+- Error messages name the tool that failed and its exit status.
+- The unused `tempfile` dev-dependency is gone; it kept
+  `cargo +1.75 test` from resolving.
+- `rust-version` lowered from `1.85` to `1.75`. CI's MSRV job now
+  builds on 1.75 against an MSRV-compatible lockfile; it was still
+  pinned to 1.85.
 
-### Notes
+### Documentation
 
-- No code change. No API change. No new dependencies.
-- Library, examples, and tests all build clean on Rust 1.75 (verified).
+- README severity table describes the CVSS scoring; allow-list codes
+  are the real cargo-deny ones (`rejected`, `banned`, `yanked`); notes
+  on the `--no-fetch` advisory database, default deny.toml behaviour
+  and de-duplication; MSRV section says 1.75.
+- `docs/API.md` covers the full `Finding`, the builder methods and
+  `AuditProducer`, and a rustdoc evidence key is corrected.
 
 [0.9.3]: https://github.com/jamesgober/dev-security/releases/tag/v0.9.3
 

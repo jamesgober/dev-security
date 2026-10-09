@@ -41,12 +41,25 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+/// Version of this crate as compiled, taken from its `Cargo.toml`.
+///
+/// Lets tools that bundle this crate, such as the `dev` CLI in
+/// `dev-tools`, report the version that is actually linked.
+///
+/// # Example
+///
+/// ```
+/// assert!(!dev_security::VERSION.is_empty());
+/// ```
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::path::PathBuf;
 
 use dev_report::{CheckResult, Evidence, Report, Severity};
 use serde::{Deserialize, Serialize};
 
 mod audit;
+mod cvss;
 mod deny;
 mod producer;
 
@@ -142,15 +155,22 @@ impl AuditRun {
         self
     }
 
-    /// Pass `--config <path>` to `cargo deny` so callers can point at a
-    /// non-default `deny.toml` location.
+    /// Pass `--config <path>` to `cargo deny check` so callers can point
+    /// at a non-default `deny.toml` location. A relative path is resolved
+    /// against the run directory (see [`in_dir`](Self::in_dir)).
+    ///
+    /// Without this, `cargo deny` reads `deny.toml` from the run
+    /// directory, and falls back to its built-in defaults (which allow no
+    /// licenses) when there is none.
     pub fn deny_config(mut self, path: impl Into<PathBuf>) -> Self {
         self.deny_config = Some(path.into());
         self
     }
 
-    /// Suppress a single advisory ID. Matches advisories from
-    /// `cargo-audit` and rule names / advisory IDs from `cargo-deny`.
+    /// Suppress a single finding ID. Matches [`Finding::id`]: advisory
+    /// IDs (`RUSTSEC-2024-0001`) from either tool, `cargo-deny`
+    /// diagnostic codes (`rejected`, `banned`, `duplicate`, ...), and
+    /// `yanked` for `cargo-audit` yanked-crate warnings.
     ///
     /// May be called repeatedly to add more entries.
     pub fn allow(mut self, id: impl Into<String>) -> Self {
@@ -190,9 +210,28 @@ impl AuditRun {
     /// Execute the audit.
     ///
     /// Each enabled tool is invoked as a subprocess. Findings are
-    /// merged, deduplicated by `(id, affected_crate)`, filtered through
-    /// the allow-list and severity threshold, then sorted by `id` for
-    /// determinism.
+    /// merged, filtered through the allow-list and severity threshold,
+    /// sorted by `id` for determinism, and deduplicated by
+    /// `(id, affected_crate, affected_version)`, keeping the most severe
+    /// copy when both tools report the same advisory.
+    ///
+    /// `cargo audit` runs with `--no-fetch`, so it reads the local copy
+    /// of the RustSec advisory database (`~/.cargo/advisory-db`). Run
+    /// `cargo audit fetch` (or any plain `cargo audit`) beforehand to
+    /// create or refresh it; without a local copy the run fails with
+    /// [`AuditError::SubprocessFailed`]. `cargo deny check` fetches its
+    /// advisory database itself.
+    ///
+    /// # Errors
+    ///
+    /// - [`AuditError::AuditToolNotInstalled`] /
+    ///   [`AuditError::DenyToolNotInstalled`] when a tool the scope needs
+    ///   is missing.
+    /// - [`AuditError::SubprocessFailed`] when a tool could not run to
+    ///   completion (no `Cargo.toml` / `Cargo.lock`, invalid `deny.toml`,
+    ///   no advisory database, ...). Finding violations is not an error.
+    /// - [`AuditError::ParseError`] when `cargo audit` output is not the
+    ///   expected JSON.
     pub fn execute(&self) -> Result<AuditResult, AuditError> {
         let mut findings: Vec<Finding> = Vec::new();
         if self.scope.runs_audit() {
@@ -211,11 +250,7 @@ impl AuditRun {
         if let Some(threshold) = self.severity_threshold {
             findings.retain(|f| severity_ord(f.severity) >= severity_ord(threshold));
         }
-        findings.sort_by(|a, b| {
-            a.id.cmp(&b.id)
-                .then_with(|| a.affected_crate.cmp(&b.affected_crate))
-        });
-        findings.dedup_by(|a, b| a.id == b.id && a.affected_crate == b.affected_crate);
+        dedup_findings(&mut findings);
 
         Ok(AuditResult {
             name: self.name.clone(),
@@ -262,11 +297,16 @@ pub enum FindingSource {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
-    /// Advisory ID (e.g. `RUSTSEC-2024-0001`) or `cargo-deny` rule code.
+    /// Advisory ID (e.g. `RUSTSEC-2024-0001`) for advisories from either
+    /// tool, otherwise the `cargo-deny` diagnostic code (e.g. `rejected`,
+    /// `banned`, `duplicate`), or `yanked` for a `cargo-audit` yanked
+    /// crate warning.
     pub id: String,
     /// Short human-readable title.
     pub title: String,
-    /// Severity classification mapped from the underlying tool.
+    /// Severity classification mapped from the underlying tool. For
+    /// `cargo-audit` vulnerabilities it comes from the advisory's CVSS
+    /// base score; see the crate README for the full mapping.
     pub severity: Severity,
     /// Affected crate name.
     pub affected_crate: String,
@@ -330,8 +370,9 @@ impl AuditResult {
     /// [`CheckResult::fail`] per finding, named
     /// `security::<source>::<id>` and tagged `security` plus a
     /// source-specific tag (`cve` for audit, `policy` for deny).
-    /// Each check carries `Evidence::KeyValue` with `crate`,
-    /// `affected_version`, and `url` when known.
+    /// Each check carries a `finding` key/value evidence with `crate`
+    /// and `id`, plus `version` and `url` when known, and a
+    /// `description` snippet when the tool supplied one.
     pub fn into_report(self) -> Report {
         let mut report = Report::new(&self.name, &self.version).with_producer("dev-security");
         if self.findings.is_empty() {
@@ -375,6 +416,26 @@ impl AuditResult {
         report.finish();
         report
     }
+}
+
+/// Sort by `(id, affected_crate, affected_version)` and drop duplicates
+/// of that key, keeping the most severe copy. `cargo-audit` and
+/// `cargo-deny` both report RustSec advisories, so the same advisory can
+/// arrive twice with different severities.
+fn dedup_findings(findings: &mut Vec<Finding>) {
+    findings.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.affected_crate.cmp(&b.affected_crate))
+            .then_with(|| a.affected_version.cmp(&b.affected_version))
+            .then_with(|| severity_ord(b.severity).cmp(&severity_ord(a.severity)))
+    });
+    // `dedup_by` keeps the first element of each run, which the sort
+    // above made the most severe one.
+    findings.dedup_by(|later, kept| {
+        later.id == kept.id
+            && later.affected_crate == kept.affected_crate
+            && later.affected_version == kept.affected_version
+    });
 }
 
 fn scope_label(s: AuditScope) -> &'static str {
@@ -568,6 +629,26 @@ mod tests {
         let back: AuditResult = serde_json::from_str(&s).unwrap();
         assert_eq!(back.findings.len(), 1);
         assert_eq!(back.findings[0].id, "RUSTSEC-2024-0001");
+    }
+
+    #[test]
+    fn dedup_keeps_most_severe_copy_and_distinct_versions() {
+        let mut audit_copy = audit_finding("RUSTSEC-2021-0139", Severity::Warning);
+        audit_copy.affected_version = Some("0.12.1".into());
+        let mut deny_copy = audit_copy.clone();
+        deny_copy.severity = Severity::Error;
+        deny_copy.source = FindingSource::Deny;
+        let mut other_version = audit_copy.clone();
+        other_version.affected_version = Some("0.11.0".into());
+
+        let mut findings = vec![audit_copy, other_version, deny_copy];
+        dedup_findings(&mut findings);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].affected_version.as_deref(), Some("0.11.0"));
+        assert_eq!(findings[1].affected_version.as_deref(), Some("0.12.1"));
+        // The cargo-deny copy is more severe, so it wins.
+        assert_eq!(findings[1].severity, Severity::Error);
+        assert_eq!(findings[1].source, FindingSource::Deny);
     }
 
     #[test]

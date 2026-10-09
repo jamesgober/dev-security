@@ -81,16 +81,24 @@ if report.failed() {
 
 ## Severity mapping
 
-| Source                                       | `dev-report::Severity` |
-|----------------------------------------------|------------------------|
-| `cargo-audit` `critical`                     | `Critical`             |
-| `cargo-audit` `high`                         | `Error`                |
-| `cargo-audit` `medium`                       | `Warning`              |
-| `cargo-audit` `low` / `none` / missing       | `Info` / `Warning`     |
-| `cargo-audit` warnings (unmaintained etc.)   | `Warning`              |
-| `cargo-deny` `error`                         | `Error`                |
-| `cargo-deny` `warning`                       | `Warning`              |
-| `cargo-deny` `help` / `note`                 | `Info`                 |
+`cargo-audit` reports each advisory's CVSS vector (v3.0, v3.1 or v4.0)
+but no score. `dev-security` computes the CVSS base score from the
+vector and maps the standard rating onto `dev-report::Severity`:
+
+| Source                                                   | `dev-report::Severity` |
+|----------------------------------------------------------|------------------------|
+| `cargo-audit` vulnerability, CVSS 9.0 - 10.0 (critical)  | `Critical`             |
+| `cargo-audit` vulnerability, CVSS 7.0 - 8.9 (high)       | `Error`                |
+| `cargo-audit` vulnerability, CVSS 4.0 - 6.9 (medium)     | `Warning`              |
+| `cargo-audit` vulnerability, CVSS 0.0 - 3.9 (low / none) | `Info`                 |
+| `cargo-audit` vulnerability without a CVSS vector        | `Warning`              |
+| `cargo-audit` warnings (unmaintained, unsound, yanked)   | `Warning`              |
+| `cargo-deny` `error`                                     | `Error`                |
+| `cargo-deny` `warning`                                   | `Warning`              |
+| `cargo-deny` `help` / `note`                             | `Info`                 |
+
+When both tools report the same advisory for the same crate version
+(scope `All`), the finding is kept once, at the higher severity.
 
 ## Allow-list + severity threshold
 
@@ -111,9 +119,11 @@ let _result = run.execute()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Allow-list entries match against the `id` field of each `Finding` —
-advisory IDs for `cargo-audit` findings (`RUSTSEC-2024-NNNN`) and
-diagnostic codes for `cargo-deny` findings (e.g. `L001`).
+Allow-list entries match against the `id` field of each `Finding`:
+advisory IDs (`RUSTSEC-2024-NNNN`) for advisories from either tool,
+diagnostic codes for other `cargo-deny` findings (e.g. `rejected` for a
+license rejection, `banned`, `duplicate`), and `yanked` for a yanked
+crate reported by `cargo-audit`.
 
 ## `Producer` integration
 
@@ -176,6 +186,16 @@ The crate detects absence of either tool and surfaces
 `AuditError::AuditToolNotInstalled` /
 `AuditError::DenyToolNotInstalled` rather than panicking.
 
+`cargo audit` is run with `--no-fetch`, so it uses the local copy of the
+RustSec advisory database. Run `cargo audit fetch` (or a plain
+`cargo audit`) once to create it, and periodically to refresh it.
+`cargo deny check` fetches its advisory database on each run.
+
+`cargo deny` reads `deny.toml` from the run directory (or the path given
+to `AuditRun::deny_config`). Without one it uses its built-in defaults,
+which allow no licenses, so every dependency is reported as `rejected`.
+Run `cargo deny init` to create a starting config.
+
 Runtime dependency footprint: `dev-report`, `serde`, `serde_json`.
 
 ## Migration from `0.1.0`
@@ -232,7 +252,7 @@ and the wire format.
 
 ## Minimum supported Rust version
 
-`1.85` — pinned in `Cargo.toml` via `rust-version` and verified by
+`1.75` — pinned in `Cargo.toml` via `rust-version` and verified by
 the MSRV job in CI.
 
 ## License
