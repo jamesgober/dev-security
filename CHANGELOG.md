@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-09
+
+Unique, stable check names.
+
+### Breaking
+
+- **Check names now identify the affected crate and version.** A failing
+  check is named `security::<source>::<id>::<crate>@<version>`, or
+  `security::<source>::<id>::<crate>` when the tool gave no version.
+  Before, the name stopped at `<id>`, so one `cargo-deny` code (for
+  example `rejected`) hitting several crates produced several checks
+  with the same name, and `Report::diff`, which matches checks by name,
+  only saw the first of them. Findings are de-duplicated on
+  `(id, crate, version)`, so every name in a report is unique, and the
+  same finding keeps its name between runs. Tooling or stored baselines
+  that match on the old names need updating once.
+
+### Added
+
+- `Finding::check_name()` returns the name a finding gets in the report.
+
+### Documentation
+
+- README "Check names" section and `docs/API.md` describe the format.
+
+[0.10.0]: https://github.com/jamesgober/dev-security/releases/tag/v0.10.0
+
 ## [0.9.3] - 2026-10-09
 
 cargo-deny results are read at all, cargo-audit severities come from

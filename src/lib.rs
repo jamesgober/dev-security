@@ -323,6 +323,50 @@ pub struct Finding {
     pub source: FindingSource,
 }
 
+impl Finding {
+    /// Name of the [`CheckResult`] this finding becomes in
+    /// [`AuditResult::into_report`]:
+    /// `security::<source>::<id>::<crate>@<version>`, or
+    /// `security::<source>::<id>::<crate>` when the version is unknown.
+    /// `<source>` is `audit` or `deny`.
+    ///
+    /// The name is built only from the finding's identity, so it is
+    /// stable across runs, and unique within a report because findings
+    /// are de-duplicated on `(id, crate, version)`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use dev_security::{Finding, FindingSource};
+    /// use dev_report::Severity;
+    ///
+    /// let f = Finding {
+    ///     id: "RUSTSEC-2024-0001".into(),
+    ///     title: "Use after free in foo".into(),
+    ///     severity: Severity::Critical,
+    ///     affected_crate: "foo".into(),
+    ///     affected_version: Some("1.2.3".into()),
+    ///     url: None,
+    ///     description: None,
+    ///     source: FindingSource::Audit,
+    /// };
+    /// assert_eq!(f.check_name(), "security::audit::RUSTSEC-2024-0001::foo@1.2.3");
+    /// ```
+    pub fn check_name(&self) -> String {
+        let source = match self.source {
+            FindingSource::Audit => "audit",
+            FindingSource::Deny => "deny",
+        };
+        match &self.affected_version {
+            Some(v) => format!(
+                "security::{source}::{}::{}@{v}",
+                self.id, self.affected_crate
+            ),
+            None => format!("security::{source}::{}::{}", self.id, self.affected_crate),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AuditResult
 // ---------------------------------------------------------------------------
@@ -368,8 +412,15 @@ impl AuditResult {
     ///
     /// Pass when there are no findings; otherwise push one
     /// [`CheckResult::fail`] per finding, named
-    /// `security::<source>::<id>` and tagged `security` plus a
-    /// source-specific tag (`cve` for audit, `policy` for deny).
+    /// `security::<source>::<id>::<crate>@<version>` (just
+    /// `...::<crate>` when the tool gave no version), and tagged
+    /// `security` plus a source-specific tag (`cve` for audit, `policy`
+    /// for deny). See [`Finding::check_name`].
+    ///
+    /// Findings are de-duplicated on `(id, crate, version)`, so every
+    /// check name in the report is unique, and the same finding gets the
+    /// same name on every run. That keeps [`Report::diff`] accurate: it
+    /// matches checks by name.
     /// Each check carries a `finding` key/value evidence with `crate`
     /// and `id`, plus `version` and `url` when known, and a
     /// `description` snippet when the tool supplied one.
@@ -383,18 +434,13 @@ impl AuditResult {
             );
         } else {
             for f in &self.findings {
-                let source_label = match f.source {
-                    FindingSource::Audit => "audit",
-                    FindingSource::Deny => "deny",
-                };
-                let mut check =
-                    CheckResult::fail(format!("security::{source_label}::{}", f.id), f.severity)
-                        .with_detail(format!("{} (in {})", f.title, f.affected_crate))
-                        .with_tag("security")
-                        .with_tag(match f.source {
-                            FindingSource::Audit => "cve",
-                            FindingSource::Deny => "policy",
-                        });
+                let mut check = CheckResult::fail(f.check_name(), f.severity)
+                    .with_detail(format!("{} (in {})", f.title, f.affected_crate))
+                    .with_tag("security")
+                    .with_tag(match f.source {
+                        FindingSource::Audit => "cve",
+                        FindingSource::Deny => "policy",
+                    });
 
                 let mut kv: Vec<(String, String)> = vec![
                     ("crate".into(), f.affected_crate.clone()),
@@ -508,6 +554,88 @@ mod tests {
         }
     }
 
+    fn deny_finding(code: &str, krate: &str, version: Option<&str>) -> Finding {
+        Finding {
+            id: code.into(),
+            title: format!("{code} {krate}"),
+            severity: Severity::Error,
+            affected_crate: krate.into(),
+            affected_version: version.map(Into::into),
+            url: None,
+            description: None,
+            source: FindingSource::Deny,
+        }
+    }
+
+    #[test]
+    fn check_names_are_unique_when_one_code_hits_many_crates() {
+        // Before 0.10, every one of these was `security::deny::rejected`
+        // and `Report::diff` only saw the first.
+        let mut findings = vec![
+            deny_finding("rejected", "openssl", Some("0.10.66")),
+            deny_finding("rejected", "ring", Some("0.17.8")),
+            deny_finding("rejected", "ring", Some("0.16.20")),
+            deny_finding("banned", "<workspace>", None),
+            audit_finding("RUSTSEC-2024-0001", Severity::Critical),
+        ];
+        dedup_findings(&mut findings);
+        let res = AuditResult {
+            name: "x".into(),
+            version: "0.1.0".into(),
+            scope: AuditScope::All,
+            findings,
+        };
+        let report = res.into_report();
+        let mut names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "security::audit::RUSTSEC-2024-0001::foo@1.2.3",
+                "security::deny::banned::<workspace>",
+                "security::deny::rejected::openssl@0.10.66",
+                "security::deny::rejected::ring@0.16.20",
+                "security::deny::rejected::ring@0.17.8",
+            ]
+        );
+    }
+
+    #[test]
+    fn report_diff_sees_each_finding_separately() {
+        let report_of = |findings: Vec<Finding>| {
+            AuditResult {
+                name: "x".into(),
+                version: "0.1.0".into(),
+                scope: AuditScope::All,
+                findings,
+            }
+            .into_report()
+        };
+        let before = report_of(vec![deny_finding("rejected", "openssl", Some("1.0.0"))]);
+        let after = report_of(vec![
+            deny_finding("rejected", "openssl", Some("1.0.0")),
+            deny_finding("rejected", "ring", Some("0.17.8")),
+        ]);
+        let diff = after.diff(&before);
+        assert_eq!(
+            diff.added,
+            vec!["security::deny::rejected::ring@0.17.8".to_string()]
+        );
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn check_name_is_stable_across_runs() {
+        let f = deny_finding("rejected", "openssl", Some("0.10.66"));
+        assert_eq!(f.check_name(), f.clone().check_name());
+        assert_eq!(f.check_name(), "security::deny::rejected::openssl@0.10.66");
+        let no_version = deny_finding("unlicensed", "my-crate", None);
+        assert_eq!(
+            no_version.check_name(),
+            "security::deny::unlicensed::my-crate"
+        );
+    }
+
     #[test]
     fn run_builds_with_full_chain() {
         let r = AuditRun::new("x", "0.1.0")
@@ -546,7 +674,7 @@ mod tests {
         let c = &report.checks[0];
         assert!(c.has_tag("security"));
         assert!(c.has_tag("cve"));
-        assert_eq!(c.name, "security::audit::RUSTSEC-2024-0001");
+        assert_eq!(c.name, "security::audit::RUSTSEC-2024-0001::foo@1.2.3");
     }
 
     #[test]

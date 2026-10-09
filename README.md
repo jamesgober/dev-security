@@ -47,7 +47,7 @@ output.
 
 ```toml
 [dependencies]
-dev-security = "0.9"
+dev-security = "0.10"
 ```
 
 One-time tool install:
@@ -142,6 +142,26 @@ let report = producer.produce();
 println!("{}", report.to_json().unwrap());
 ```
 
+## Check names
+
+`AuditResult::into_report` emits one failing check per finding, named
+
+```text
+security::<source>::<id>::<crate>@<version>
+security::<source>::<id>::<crate>          (when the tool gave no version)
+```
+
+where `<source>` is `audit` or `deny` and `<id>` is the RUSTSEC id or
+the `cargo-deny` code. Examples:
+`security::audit::RUSTSEC-2024-0001::foo@1.2.3`,
+`security::deny::rejected::openssl@0.10.66`. Findings are
+de-duplicated on `(id, crate, version)`, so names are unique within a
+report and the same finding keeps its name from run to run, which is
+what `Report::diff` needs to match checks. `Finding::check_name`
+returns the same string. (Before 0.10 the name stopped at `<id>`, so
+one `cargo-deny` code hitting several crates produced repeated names.)
+
+A run with no findings emits one passing `security::audit` check.
 Subprocess failures map to a single failing `CheckResult` named
 `security::audit` with `Severity::Critical` — the pipeline keeps
 running.
@@ -245,7 +265,7 @@ dimensions:
 
 ## Status
 
-`v0.9.x` is the pre-1.0 stabilization line. The API is feature-complete
+`v0.10.x` continues the pre-1.0 stabilization line. The API is feature-complete
 for vulnerability scanning, policy enforcement, allow-listing, and
 severity gating. Production use is fine; `1.0` will pin the public API
 and the wire format.

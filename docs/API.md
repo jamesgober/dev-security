@@ -148,7 +148,19 @@ pub fn into_report(self) -> Report
 ```
 
 Convert findings into a `dev-report::Report`. Empty findings produces
-a passing `security::audit` check.
+a passing `security::audit` check. Otherwise each finding becomes a
+failing check named by `Finding::check_name`:
+`security::<source>::<id>::<crate>@<version>` (or
+`security::<source>::<id>::<crate>` without a version). Names are
+unique within a report and stable across runs.
+
+### `Finding::check_name`
+
+```rust
+pub fn check_name(&self) -> String
+```
+
+The check name described above.
 
 ---
 
