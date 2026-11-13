@@ -19,22 +19,22 @@
 //! `ERROR` logs without a summary mean the run itself failed (bad
 //! config, missing `Cargo.toml`, advisory DB fetch failure, ...).
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 use dev_report::Severity;
 use serde::Deserialize;
+use serde_json::Value;
 
-use crate::audit::{advisory_url, Advisory};
+use crate::audit::{advisory_from_value, advisory_url, first_200};
 use crate::{AuditError, Finding, FindingSource};
 
 pub(crate) fn run(
     workdir: Option<&Path>,
     config: Option<&Path>,
 ) -> Result<Vec<Finding>, AuditError> {
-    detect()?;
-    let mut cmd = Command::new("cargo");
-    cmd.args(["deny", "--format", "json", "check"]);
+    let bin = detect()?;
+    let mut cmd = crate::tool::command(&bin, "deny");
+    cmd.args(["--format", "json", "check"]);
     // `--config` is an option of the `check` subcommand, not of
     // `cargo deny` itself (where `-c` means `--color`).
     if let Some(c) = config {
@@ -90,13 +90,32 @@ fn outcome(
             "cargo deny exited with {status}: {detail}"
         )));
     }
+    // cargo-deny exits non-zero only when a check failed with an error.
+    // If no error-level finding was read, the output changed shape or
+    // the tool failed in a way this parser does not know. Never let that
+    // read as a clean run.
+    if !success && !parsed.findings.iter().any(|f| is_blocking(f.severity)) {
+        let mut parts = parsed.errors;
+        if parts.is_empty() {
+            parts.push(first_200(stderr.trim()).to_string());
+        }
+        return Err(AuditError::SubprocessFailed(format!(
+            "cargo deny exited with {status} but reported no errors: {}",
+            parts.join("; ")
+        )));
+    }
     Ok(parsed.findings)
 }
 
-fn detect() -> Result<(), AuditError> {
-    let out = Command::new("cargo").args(["deny", "--version"]).output();
+fn is_blocking(s: Severity) -> bool {
+    matches!(s, Severity::Error | Severity::Critical)
+}
+
+fn detect() -> Result<PathBuf, AuditError> {
+    let bin = crate::tool::resolve("cargo-deny").ok_or(AuditError::DenyToolNotInstalled)?;
+    let out = crate::tool::command(&bin, "deny").arg("--version").output();
     match out {
-        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) if o.status.success() => Ok(bin),
         _ => Err(AuditError::DenyToolNotInstalled),
     }
 }
@@ -113,48 +132,62 @@ struct DenyRecord {
     fields: serde_json::Value,
 }
 
-#[derive(Deserialize, Default)]
+/// A diagnostic's fields, read one by one so a field with an unexpected
+/// type loses only that field and never the whole diagnostic.
 struct DenyFields {
-    #[serde(default)]
     severity: String,
-    #[serde(default)]
     code: Option<String>,
-    #[serde(default)]
     message: String,
-    #[serde(default)]
-    graphs: Vec<DenyGraph>,
-    #[serde(default)]
-    labels: Vec<DenyLabel>,
-    #[serde(default)]
-    advisory: Option<Advisory>,
+    /// `(name, version)` of the first crate in `graphs`.
+    krate: (Option<String>, Option<String>),
+    labels: Vec<(String, String)>,
+    advisory: Option<crate::audit::Advisory>,
 }
 
-/// Inclusion graph for the affected crate. Current cargo-deny nests the
-/// crate under `Krate`; a flat `name` / `version` pair is accepted too.
-#[derive(Deserialize, Default)]
-struct DenyGraph {
-    #[serde(default, rename = "Krate")]
-    krate: Option<DenyKrate>,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    version: String,
+fn str_of(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-#[derive(Deserialize, Default)]
-struct DenyKrate {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    version: String,
-}
-
-#[derive(Deserialize, Default)]
-struct DenyLabel {
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    span: String,
+impl DenyFields {
+    fn from_value(v: &Value) -> Self {
+        // Current cargo-deny nests the crate under `Krate`; a flat
+        // `name` / `version` pair is accepted too. `graphs` is an array,
+        // but a lone graph object is read the same way.
+        let graph = match v.get("graphs") {
+            Some(Value::Array(items)) => items.first(),
+            Some(g @ Value::Object(_)) => Some(g),
+            _ => None,
+        };
+        let krate = graph
+            .map(|g| {
+                let k = g.get("Krate").filter(|k| k.is_object()).unwrap_or(g);
+                (
+                    str_of(k, "name").filter(|s| !s.is_empty()),
+                    str_of(k, "version").filter(|s| !s.is_empty()),
+                )
+            })
+            .unwrap_or((None, None));
+        let labels = match v.get("labels") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|l| {
+                    (
+                        str_of(l, "message").unwrap_or_default(),
+                        str_of(l, "span").unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            severity: str_of(v, "severity").unwrap_or_default(),
+            code: str_of(v, "code"),
+            message: str_of(v, "message").unwrap_or_default(),
+            krate,
+            labels,
+            advisory: v.get("advisory").and_then(advisory_from_value),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -207,11 +240,14 @@ fn parse_records(ndjson: &str) -> Parsed {
             }
             _ => continue,
         }
-        let Ok(fields) = serde_json::from_value::<DenyFields>(record.fields) else {
-            continue;
-        };
-        let Some(severity) = severity_from_label(&fields.severity) else {
-            continue;
+        let fields = DenyFields::from_value(&record.fields);
+        // A severity this parser does not know is treated as an error,
+        // so a new label from cargo-deny cannot hide a finding.
+        let severity = severity_from_label(&fields.severity).unwrap_or(Severity::Error);
+        let raw_description = if record.fields.is_object() {
+            None
+        } else {
+            Some(first_200(line).to_string())
         };
 
         // Advisory diagnostics use the advisory id (e.g. RUSTSEC-2022-0013)
@@ -233,14 +269,7 @@ fn parse_records(ndjson: &str) -> Parsed {
         // Empty `graphs` is legitimate (e.g. a config-level warning such
         // as `license-not-encountered`); represent it explicitly rather
         // than emitting an empty crate name.
-        let (affected_crate, affected_version) = fields
-            .graphs
-            .first()
-            .map(|g| match &g.krate {
-                Some(k) => (non_empty(&k.name), non_empty(&k.version)),
-                None => (non_empty(&g.name), non_empty(&g.version)),
-            })
-            .unwrap_or((None, None));
+        let (affected_crate, affected_version) = fields.krate.clone();
 
         out.findings.push(Finding {
             id,
@@ -249,7 +278,7 @@ fn parse_records(ndjson: &str) -> Parsed {
             affected_crate: affected_crate.unwrap_or_else(|| "<workspace>".to_string()),
             affected_version,
             url: fields.advisory.as_ref().and_then(advisory_url),
-            description: description(&fields.message, &fields.labels),
+            description: description(&fields.message, &fields.labels).or(raw_description),
             source: FindingSource::Deny,
         });
     }
@@ -258,19 +287,19 @@ fn parse_records(ndjson: &str) -> Parsed {
 
 /// The diagnostic message plus any labelled spans, e.g.
 /// `MIT: rejected: license is not explicitly allowed`.
-fn description(message: &str, labels: &[DenyLabel]) -> Option<String> {
+fn description(message: &str, labels: &[(String, String)]) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if !message.is_empty() {
         lines.push(message.to_string());
     }
-    for l in labels {
-        if l.message.is_empty() {
+    for (msg, span) in labels {
+        if msg.is_empty() {
             continue;
         }
-        if l.span.is_empty() {
-            lines.push(l.message.clone());
+        if span.is_empty() {
+            lines.push(msg.clone());
         } else {
-            lines.push(format!("{}: {}", l.span, l.message));
+            lines.push(format!("{span}: {msg}"));
         }
     }
     if lines.is_empty() {
@@ -305,14 +334,6 @@ fn short_title(msg: &str) -> String {
         let mut s = first_line[..end].to_string();
         s.push_str("...");
         s
-    }
-}
-
-fn non_empty(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
     }
 }
 
@@ -473,9 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn skips_unknown_severity_levels() {
+    fn unknown_severity_levels_count_as_errors() {
         let ndjson = r#"{"type":"diagnostic","fields":{"severity":"???","message":"x"}}"#;
-        assert!(parse(ndjson).unwrap().is_empty());
+        let findings = parse(ndjson).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
     }
 
     #[test]
@@ -489,7 +512,57 @@ not-json
 {"type":"diagnostic","fields":{"severity":"warning","code":"W1","message":"y"}}
 "#;
         let findings = parse(ndjson).unwrap();
-        assert_eq!(findings.len(), 2);
+        // Every diagnostic is kept, even one whose fields could not be
+        // read; it falls back to an error with the raw line as detail.
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["E1", "DENY-0004", "E2", "W1"]);
+        assert_eq!(findings[1].severity, Severity::Error);
+        assert!(findings[1]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("not an object"));
+    }
+
+    #[test]
+    fn graphs_object_instead_of_array_still_fails_the_run() {
+        // cargo-deny exits 1 with an error whose `graphs` is an object.
+        let stderr = r#"{"type":"diagnostic","fields":{"severity":"error","code":"banned","message":"crate `openssl` is explicitly banned","graphs":{"Krate":{"name":"openssl","version":"0.10.66"}}}}
+{"type":"summary","fields":{"bans":{"errors":1}}}"#;
+        let findings = outcome("", stderr, false, "exit code: 1").unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "banned");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].affected_crate, "openssl");
+        assert_eq!(findings[0].affected_version.as_deref(), Some("0.10.66"));
+    }
+
+    #[test]
+    fn unknown_severity_on_a_failed_run_is_an_error_finding() {
+        // cargo-deny exits 1 with a diagnostic of severity `bug`.
+        let stderr = r#"{"type":"diagnostic","fields":{"severity":"bug","code":"internal","message":"internal error","graphs":[]}}
+{"type":"summary","fields":{}}"#;
+        let findings = outcome("", stderr, false, "exit code: 1").unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "internal");
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn failed_run_with_no_error_finding_is_not_clean() {
+        // Non-zero exit, a summary, and only a warning: the reason for
+        // the failure was not read, so the run is an error.
+        let stderr = r#"{"type":"diagnostic","fields":{"severity":"warning","code":"W1","message":"y"}}
+{"type":"summary","fields":{}}"#;
+        let err = outcome("", stderr, false, "exit code: 1").unwrap_err();
+        assert!(matches!(err, AuditError::SubprocessFailed(_)), "{err}");
+
+        let only_summary = r#"{"type":"summary","fields":{}}"#;
+        assert!(outcome("", only_summary, false, "exit code: 1").is_err());
+        // The same output with a zero exit is a clean run.
+        assert!(outcome("", only_summary, true, "exit code: 0")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

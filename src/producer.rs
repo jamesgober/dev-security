@@ -45,7 +45,8 @@ impl Producer for AuditProducer {
         match self.run.execute() {
             Ok(result) => result.into_report(),
             Err(e) => {
-                let mut report = Report::new(&subject, &version).with_producer("dev-security");
+                let mut report =
+                    Report::new(subject.as_str(), version.as_str()).with_producer("dev-security");
                 let check = CheckResult::fail("security::audit", Severity::Critical)
                     .with_detail(e.to_string())
                     .with_tag("security")

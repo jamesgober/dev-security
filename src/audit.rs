@@ -1,42 +1,73 @@
 //! `cargo audit` subprocess invocation + JSON parsing.
 
 use std::path::Path;
-use std::process::Command;
 
 use dev_report::Severity;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{AuditError, Finding, FindingSource};
 
 pub(crate) fn run(workdir: Option<&Path>) -> Result<Vec<Finding>, AuditError> {
-    detect()?;
-    let mut cmd = Command::new("cargo");
-    cmd.args(["audit", "--json", "--no-fetch"]);
+    let bin = detect()?;
+    let mut cmd = crate::tool::command(&bin, "audit");
+    cmd.args(["--json", "--no-fetch"]);
     if let Some(d) = workdir {
         cmd.current_dir(d);
     }
     let output = cmd
         .output()
         .map_err(|e| AuditError::SubprocessFailed(format!("could not spawn cargo audit: {e}")))?;
-    // cargo-audit exits non-zero when it finds vulnerabilities — that
-    // is the success path for us. Treat unparseable stdout as the real
-    // failure signal instead of the exit code.
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if stdout.trim().is_empty() && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    outcome(
+        &stdout,
+        &stderr,
+        output.status.success(),
+        &output.status.to_string(),
+    )
+}
+
+/// Turn one `cargo audit` run into findings or an error.
+///
+/// cargo-audit exits non-zero when it finds vulnerabilities, so a
+/// non-zero exit on its own is not a failure. It is one when the output
+/// does not account for it: a non-zero exit with no vulnerability parsed
+/// means the tool failed, or wrote something this parser does not
+/// understand. Either way the run must not read as clean.
+fn outcome(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    status: &str,
+) -> Result<Vec<Finding>, AuditError> {
+    if stdout.trim().is_empty() && !success {
         return Err(AuditError::SubprocessFailed(format!(
-            "cargo audit exited with {}: {}",
-            output.status,
+            "cargo audit exited with {status}: {}",
             stderr.trim()
         )));
     }
-    parse(&stdout)
+    let parsed = parse_output(stdout)?;
+    if !success && parsed.vulnerabilities == 0 {
+        let detail = if stderr.trim().is_empty() {
+            format!("output: {:?}", first_200(stdout.trim()))
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(AuditError::SubprocessFailed(format!(
+            "cargo audit exited with {status} but reported no vulnerabilities: {detail}"
+        )));
+    }
+    Ok(parsed.findings)
 }
 
-fn detect() -> Result<(), AuditError> {
-    let out = Command::new("cargo").args(["audit", "--version"]).output();
+fn detect() -> Result<std::path::PathBuf, AuditError> {
+    let bin = crate::tool::resolve("cargo-audit").ok_or(AuditError::AuditToolNotInstalled)?;
+    let out = crate::tool::command(&bin, "audit")
+        .arg("--version")
+        .output();
     match out {
-        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) if o.status.success() => Ok(bin),
         _ => Err(AuditError::AuditToolNotInstalled),
     }
 }
@@ -44,20 +75,6 @@ fn detect() -> Result<(), AuditError> {
 // ---------------------------------------------------------------------------
 // JSON shape
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize, Default)]
-struct AuditReport {
-    #[serde(default)]
-    vulnerabilities: Vulnerabilities,
-    #[serde(default)]
-    warnings: serde_json::Value,
-}
-
-#[derive(Deserialize, Default)]
-struct Vulnerabilities {
-    #[serde(default)]
-    list: Vec<serde_json::Value>,
-}
 
 #[derive(Deserialize, Default)]
 pub(crate) struct Advisory {
@@ -82,74 +99,174 @@ pub(crate) struct Advisory {
     pub(crate) severity: Option<String>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Default, Clone)]
 struct Package {
-    #[serde(default)]
     name: String,
-    #[serde(default)]
     version: String,
 }
 
 /// One entry of `vulnerabilities.list` or of a `warnings.<kind>` array.
 /// `advisory` is `null` for `yanked` warnings.
-#[derive(Deserialize)]
+///
+/// Entries are read field by field rather than through a strict schema,
+/// so one field with an unexpected type (a CVSS object where a vector
+/// string was expected, say) loses only that field, never the entry.
 struct Entry {
-    #[serde(default)]
     kind: Option<String>,
-    #[serde(default)]
     advisory: Option<Advisory>,
-    #[serde(default)]
     package: Package,
+    /// The entry was not a JSON object, or had no usable advisory where
+    /// one was required. Kept so it still becomes a finding.
+    raw: Option<String>,
 }
 
+fn str_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Read an advisory object leniently. Returns `None` when `v` is not an
+/// object.
+pub(crate) fn advisory_from_value(v: &Value) -> Option<Advisory> {
+    if !v.is_object() {
+        return None;
+    }
+    Some(Advisory {
+        id: str_field(v, "id").unwrap_or_default(),
+        title: str_field(v, "title").unwrap_or_default(),
+        description: str_field(v, "description"),
+        url: str_field(v, "url"),
+        cvss: str_field(v, "cvss"),
+        severity: str_field(v, "severity"),
+    })
+}
+
+fn entry_from_value(v: &Value) -> Entry {
+    let package = v.get("package");
+    Entry {
+        kind: str_field(v, "kind"),
+        advisory: v.get("advisory").and_then(advisory_from_value),
+        package: Package {
+            name: package
+                .and_then(|p| str_field(p, "name"))
+                .unwrap_or_default(),
+            version: package
+                .and_then(|p| str_field(p, "version"))
+                .unwrap_or_default(),
+        },
+        raw: if v.is_object() {
+            None
+        } else {
+            Some(first_200(&v.to_string()).to_string())
+        },
+    }
+}
+
+/// What one `cargo audit --json` document contained.
+struct Parsed {
+    findings: Vec<Finding>,
+    /// How many of `findings` came from `vulnerabilities.list`.
+    vulnerabilities: usize,
+}
+
+#[cfg(test)]
 pub(crate) fn parse(json: &str) -> Result<Vec<Finding>, AuditError> {
-    let report: AuditReport = serde_json::from_str(json).map_err(|e| {
+    parse_output(json).map(|p| p.findings)
+}
+
+fn parse_output(json: &str) -> Result<Parsed, AuditError> {
+    let report: Value = serde_json::from_str(json).map_err(|e| {
         AuditError::ParseError(format!("{e}; first 200 chars: {:?}", first_200(json)))
     })?;
+    let parse_error = |what: &str| {
+        AuditError::ParseError(format!("{what}; first 200 chars: {:?}", first_200(json)))
+    };
+    let vulns = match report.get("vulnerabilities") {
+        Some(v @ Value::Object(_)) => v,
+        Some(_) => return Err(parse_error("`vulnerabilities` is not an object")),
+        None => {
+            return Err(parse_error(
+                "no `vulnerabilities` key in cargo audit output",
+            ))
+        }
+    };
+    let list: &[Value] = match vulns.get("list") {
+        Some(Value::Array(items)) => items,
+        None | Some(Value::Null) => &[],
+        Some(_) => return Err(parse_error("`vulnerabilities.list` is not an array")),
+    };
 
     let mut findings = Vec::new();
-    // Entries are decoded one at a time so a single entry with an
-    // unexpected shape cannot drop its neighbours.
-    for value in report.vulnerabilities.list {
-        let Ok(v) = serde_json::from_value::<Entry>(value) else {
-            continue;
+    for value in list {
+        let v = entry_from_value(value);
+        let package = v.package;
+        let finding = match v.advisory {
+            Some(advisory) => Finding {
+                severity: advisory_severity(&advisory).unwrap_or(Severity::Warning),
+                url: advisory_url(&advisory),
+                id: if advisory.id.is_empty() {
+                    "unknown-advisory".to_string()
+                } else {
+                    advisory.id
+                },
+                title: advisory.title,
+                affected_crate: package.name,
+                affected_version: non_empty(&package.version),
+                description: advisory.description,
+                source: FindingSource::Audit,
+            },
+            // A vulnerability entry without a readable advisory is still
+            // a vulnerability. Keep it, at a severity that fails the gate.
+            None => Finding {
+                id: "unknown-advisory".to_string(),
+                title: "cargo audit reported a vulnerability that could not be read".to_string(),
+                severity: Severity::Error,
+                affected_crate: package.name,
+                affected_version: non_empty(&package.version),
+                url: None,
+                description: Some(
+                    v.raw
+                        .unwrap_or_else(|| first_200(&value.to_string()).to_string()),
+                ),
+                source: FindingSource::Audit,
+            },
         };
-        let Some(advisory) = v.advisory else {
-            continue;
-        };
-        findings.push(Finding {
-            severity: advisory_severity(&advisory).unwrap_or(Severity::Warning),
-            url: advisory_url(&advisory),
-            id: advisory.id,
-            title: advisory.title,
-            affected_crate: v.package.name,
-            affected_version: non_empty(&v.package.version),
-            description: advisory.description,
-            source: FindingSource::Audit,
-        });
+        findings.push(finding);
+    }
+    let vulnerabilities = findings.len();
+
+    // cargo-audit states how many vulnerabilities it found. If that is
+    // more than were read here, the output changed shape and the gate
+    // must not pass on what is left.
+    let found = vulns.get("found").and_then(Value::as_bool).unwrap_or(false);
+    let count = vulns.get("count").and_then(Value::as_u64).unwrap_or(0);
+    if (found && vulnerabilities == 0) || count > vulnerabilities as u64 {
+        return Err(parse_error(&format!(
+            "cargo audit reported {count} vulnerabilities (found: {found}) but {vulnerabilities} could be read"
+        )));
     }
 
     // `warnings` is an object keyed by warning kind (`unmaintained`,
     // `unsound`, `yanked`, `notice`, ...). Each value is an array of
     // entries; a bare object is accepted too.
-    if let serde_json::Value::Object(map) = report.warnings {
+    if let Some(Value::Object(map)) = report.get("warnings") {
         for (kind, value) in map {
-            let values = match value {
-                serde_json::Value::Array(items) => items,
-                obj @ serde_json::Value::Object(_) => vec![obj],
+            let values: Vec<&Value> = match value {
+                Value::Array(items) => items.iter().collect(),
+                obj @ Value::Object(_) => vec![obj],
                 _ => Vec::new(),
             };
             for value in values {
-                let Ok(e) = serde_json::from_value::<Entry>(value) else {
-                    continue;
-                };
+                let e = entry_from_value(value);
                 let kind = e.kind.clone().unwrap_or_else(|| kind.clone());
                 findings.push(warning_finding(&kind, e));
             }
         }
     }
 
-    Ok(findings)
+    Ok(Parsed {
+        findings,
+        vulnerabilities,
+    })
 }
 
 /// Warnings (unmaintained, unsound, yanked, notice) describe risk rather
@@ -172,7 +289,11 @@ fn warning_finding(kind: &str, e: Entry) -> Finding {
             id: kind.to_string(),
             title: format!(
                 "{} {} is {kind}",
-                e.package.name,
+                if e.package.name.is_empty() {
+                    "(unknown crate)"
+                } else {
+                    &e.package.name
+                },
                 if e.package.version.is_empty() {
                     "(unknown version)"
                 } else {
@@ -181,9 +302,13 @@ fn warning_finding(kind: &str, e: Entry) -> Finding {
             ),
             severity: Severity::Warning,
             affected_version: non_empty(&e.package.version),
-            affected_crate: e.package.name,
+            affected_crate: if e.package.name.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                e.package.name
+            },
             url: None,
-            description: None,
+            description: e.raw,
             source: FindingSource::Audit,
         },
     }
@@ -477,7 +602,63 @@ mod tests {
         }"#;
         let findings = parse(json).unwrap();
         let crates: Vec<&str> = findings.iter().map(|f| f.affected_crate.as_str()).collect();
-        assert_eq!(crates, ["good", "a", "b"]);
+        // The vulnerability whose advisory could not be read is kept, and
+        // fails the gate, instead of being dropped.
+        assert_eq!(crates, ["bad", "good", "a", "<unknown>", "b"]);
+        assert_eq!(findings[0].id, "unknown-advisory");
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn unreadable_cvss_keeps_the_vulnerability() {
+        // cargo-audit exits 1 and says one vulnerability was found, but
+        // the CVSS field is an object instead of a vector string.
+        let stdout = r#"{"database":{},"lockfile":{},"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2099-0001","title":"RCE in foo","cvss":{"score":9.8}},"package":{"name":"foo","version":"1.0.0"}}]},"warnings":{}}"#;
+        let findings = outcome(stdout, "", false, "exit code: 1").unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "RUSTSEC-2099-0001");
+        assert_eq!(findings[0].affected_crate, "foo");
+        assert_eq!(findings[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn json_without_vulnerabilities_is_an_error() {
+        // cargo-audit exits 2 and prints an error object.
+        let stdout = r#"{"error":"lockfile could not be parsed"}"#;
+        let err = outcome(stdout, "", false, "exit code: 2").unwrap_err();
+        assert!(matches!(err, AuditError::ParseError(_)), "{err}");
+        // Missing the key is an error even with a zero exit.
+        assert!(matches!(
+            parse(stdout).unwrap_err(),
+            AuditError::ParseError(_)
+        ));
+    }
+
+    #[test]
+    fn count_larger_than_entries_read_is_an_error() {
+        let found_none_read = r#"{"vulnerabilities":{"found":true,"count":1,"list":[]}}"#;
+        assert!(matches!(
+            parse(found_none_read).unwrap_err(),
+            AuditError::ParseError(_)
+        ));
+        let count_short = r#"{"vulnerabilities":{"found":true,"count":2,"list":[
+            {"advisory":{"id":"A","title":"t"},"package":{"name":"p","version":"1.0.0"}}
+        ]}}"#;
+        assert!(parse(count_short).is_err());
+        let list_wrong_type = r#"{"vulnerabilities":{"found":false,"count":0,"list":{}}}"#;
+        assert!(parse(list_wrong_type).is_err());
+    }
+
+    #[test]
+    fn non_zero_exit_with_no_vulnerability_is_an_error() {
+        let clean = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}"#;
+        assert!(outcome(clean, "", true, "exit code: 0").unwrap().is_empty());
+        let err = outcome(clean, "boom", false, "exit code: 1").unwrap_err();
+        assert!(matches!(err, AuditError::SubprocessFailed(_)), "{err}");
+        assert!(err.to_string().contains("boom"));
+        // Empty stdout with a failure exit passes stderr on.
+        let err = outcome("", "no Cargo.lock", false, "exit code: 1").unwrap_err();
+        assert!(err.to_string().contains("no Cargo.lock"));
     }
 
     #[test]

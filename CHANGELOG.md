@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-12
+
+The audit no longer passes when a tool failed or wrote output it could
+not read, and it no longer runs tools through `cargo`. 0.10.0 was
+tagged but never published to crates.io, so this is the first 0.10
+release there; its notes below still apply.
+
+### Security
+
+- `cargo audit` and `cargo deny` were started through `cargo`, which
+  gives an `[alias]` in the audited tree's `.cargo/config.toml`
+  precedence over the external subcommand. Auditing a checkout you do
+  not trust could run that checkout's code and report a clean result.
+  The tool binaries are now found in `$CARGO_HOME/bin` or on `PATH` and
+  started directly, the way cargo starts them.
+
+### Fixed
+
+- cargo-audit output that did not parse as expected could produce a
+  passing report. The exit status, `vulnerabilities.found` and
+  `vulnerabilities.count` were ignored, and an entry that failed to
+  decode was skipped. Now:
+  - output without a `vulnerabilities` object is a `ParseError`;
+  - `found: true` with nothing parsed, or a `count` above the number of
+    entries read, is a `ParseError`;
+  - a non-zero exit with no vulnerability parsed is `SubprocessFailed`;
+  - entries are read field by field, so one field of an unexpected type
+    (a CVSS object instead of a vector string, say) no longer drops the
+    entry. A vulnerability with no readable advisory is kept as
+    `unknown-advisory` at `Error`.
+- cargo-deny diagnostics with an unknown severity, or with fields of an
+  unexpected shape, were skipped. Unknown severities now count as
+  `Error`, a lone `graphs` object is read like a one-element array, and
+  a diagnostic whose fields cannot be read is kept with the raw line as
+  its description. A run that exits non-zero without an error-level
+  finding is `SubprocessFailed`.
+
+### Changed
+
+- Depends on `dev-report` 0.9.9 from crates.io instead of a sibling
+  checkout.
+
+[0.10.1]: https://github.com/jamesgober/dev-security/releases/tag/v0.10.1
+
 ## [0.10.0] - 2026-10-09
 
 Unique, stable check names.
