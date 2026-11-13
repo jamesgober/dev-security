@@ -179,7 +179,12 @@ Tool remediation: `cargo install cargo-audit cargo-deny`.
 
 `SubprocessFailed` covers runs that could not complete: no `Cargo.toml`
 or `Cargo.lock`, an invalid `deny.toml`, a missing advisory database.
-Finding violations is not an error.
+It also covers a tool that exited with a failure its output does not
+explain: cargo-audit exiting non-zero with no vulnerability parsed, or
+cargo-deny exiting non-zero with no error-level finding. `ParseError`
+covers cargo-audit output that is not JSON, has no `vulnerabilities`
+object, or reports more vulnerabilities (`found`, `count`) than could
+be read. Finding violations is not an error.
 
 ---
 

@@ -206,6 +206,23 @@ The crate detects absence of either tool and surfaces
 `AuditError::AuditToolNotInstalled` /
 `AuditError::DenyToolNotInstalled` rather than panicking.
 
+The tools are started directly (`cargo-audit audit ...`,
+`cargo-deny deny ...`), not through `cargo`. They are looked up in
+`$CARGO_HOME/bin` (by default `~/.cargo/bin`) and then on `PATH`, the
+same order cargo uses. Going through `cargo` would let an `[alias]` in
+the audited tree's `.cargo/config.toml` replace `audit` or `deny` with
+a command of its own. cargo-deny still reads the audited tree's
+`deny.toml` unless `AuditRun::deny_config` names another file, so a
+tree you do not trust can loosen its own policy that way.
+
+A run never reads as clean when the tool's own output says otherwise.
+cargo-audit output without a `vulnerabilities` section, a `count` or
+`found` that the parsed entries do not account for, or a non-zero exit
+with no vulnerability parsed is an error. A cargo-deny run that exits
+non-zero without an error-level finding is an error too. A diagnostic
+with an unknown severity counts as an error, and an entry whose fields
+cannot be read is kept as a finding rather than dropped.
+
 `cargo audit` is run with `--no-fetch`, so it uses the local copy of the
 RustSec advisory database. Run `cargo audit fetch` (or a plain
 `cargo audit`) once to create it, and periodically to refresh it.

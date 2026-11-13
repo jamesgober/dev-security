@@ -62,6 +62,7 @@ mod audit;
 mod cvss;
 mod deny;
 mod producer;
+mod tool;
 
 pub use producer::AuditProducer;
 
@@ -229,9 +230,15 @@ impl AuditRun {
     ///   is missing.
     /// - [`AuditError::SubprocessFailed`] when a tool could not run to
     ///   completion (no `Cargo.toml` / `Cargo.lock`, invalid `deny.toml`,
-    ///   no advisory database, ...). Finding violations is not an error.
+    ///   no advisory database, ...), or exited with a failure that its
+    ///   output does not explain. Finding violations is not an error.
     /// - [`AuditError::ParseError`] when `cargo audit` output is not the
-    ///   expected JSON.
+    ///   expected JSON, or reports more vulnerabilities than could be
+    ///   read from it.
+    ///
+    /// The tools are started directly from `$CARGO_HOME/bin` or `PATH`,
+    /// not through `cargo`, so an `[alias]` in the audited tree cannot
+    /// stand in for them.
     pub fn execute(&self) -> Result<AuditResult, AuditError> {
         let mut findings: Vec<Finding> = Vec::new();
         if self.scope.runs_audit() {
